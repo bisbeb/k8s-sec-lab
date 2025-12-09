@@ -97,10 +97,12 @@ delete_cluster_resources() {
     # Delete ClusterRoleBindings created by lab
     kubectl delete clusterrolebinding security-reader-binding 2>/dev/null || true
     kubectl delete clusterrolebinding dangerous-admin-binding 2>/dev/null || true
+    kubectl delete clusterrolebinding fluent-bit-read 2>/dev/null || true
     
     # Delete ClusterRoles created by lab
     kubectl delete clusterrole security-reader 2>/dev/null || true
     kubectl delete clusterrole dangerous-admin 2>/dev/null || true
+    kubectl delete clusterrole fluent-bit-read 2>/dev/null || true
     
     # Delete any Kyverno policies if installed
     kubectl delete clusterpolicy --all 2>/dev/null || true

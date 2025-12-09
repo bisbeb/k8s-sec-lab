@@ -6,12 +6,12 @@
 
 set -e
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 TIMEOUT=300
 
@@ -85,15 +85,31 @@ EOF
 }
 
 deploy_dvwa() {
-    print_status "Deploying DVWA..."
+    print_status "Deploying DVWA (with MySQL sidecar)..."
     
     kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dvwa-config
+  namespace: vulnerable-apps
+data:
+  RECAPTCHA_PRIV_KEY: ""
+  RECAPTCHA_PUB_KEY: ""
+  SECURITY_LEVEL: "low"
+  PHPIDS_ENABLED: "0"
+  DB_SERVER: "127.0.0.1"
+  DB_DATABASE: "dvwa"
+  DB_USER: "dvwa"
+  DB_PASSWORD: "p@ssw0rd"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: dvwa
   namespace: vulnerable-apps
   labels:
+    app: dvwa
     purpose: security-training
 spec:
   replicas: 1
@@ -107,20 +123,67 @@ spec:
         purpose: security-training
     spec:
       containers:
+      # DVWA Web Application
       - name: dvwa
-        image: vulnerables/web-dvwa:latest
+        image: ghcr.io/digininja/dvwa:latest
         ports:
         - containerPort: 80
-        env:
-        - name: MYSQL_ROOT_PASSWORD
-          value: "dvwa"
+          name: http
+        envFrom:
+        - configMapRef:
+            name: dvwa-config
         resources:
           requests:
             memory: "128Mi"
             cpu: "100m"
           limits:
+            memory: "256Mi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /login.php
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          failureThreshold: 10
+        livenessProbe:
+          httpGet:
+            path: /login.php
+            port: 80
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      # MariaDB Database (sidecar) - ARM64 compatible
+      - name: mysql
+        image: mariadb:10.11
+        env:
+        - name: MARIADB_ROOT_PASSWORD
+          value: "dvwa"
+        - name: MARIADB_DATABASE
+          value: "dvwa"
+        - name: MARIADB_USER
+          value: "dvwa"
+        - name: MARIADB_PASSWORD
+          value: "p@ssw0rd"
+        ports:
+        - containerPort: 3306
+          name: mysql
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
             memory: "512Mi"
             cpu: "500m"
+        readinessProbe:
+          exec:
+            command: ["mariadb-admin", "ping", "-h", "localhost"]
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["mariadb-admin", "ping", "-h", "localhost"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -171,6 +234,18 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -222,6 +297,19 @@ spec:
           limits:
             memory: "1Gi"
             cpu: "1000m"
+        readinessProbe:
+          httpGet:
+            path: /WebGoat
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 10
+        livenessProbe:
+          httpGet:
+            path: /WebGoat
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -285,6 +373,12 @@ spec:
           limits:
             memory: "2Gi"
             cpu: "2"
+        readinessProbe:
+          exec:
+            command: ["cat", "/tmp/ready"]
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 30
 EOF
     print_success "Kali deployment created"
 }
@@ -321,6 +415,9 @@ spec:
         - name: ES_JAVA_OPTS
           value: "-Xms512m -Xmx512m"
         resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
           limits:
             memory: "2Gi"
             cpu: "1"
@@ -359,6 +456,13 @@ spec:
         env:
         - name: ELASTICSEARCH_HOSTS
           value: "http://elasticsearch:9200"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
@@ -374,15 +478,170 @@ EOF
     print_success "Monitoring deployed"
 }
 
+deploy_fluent_bit() {
+    print_status "Deploying Fluent Bit log collector..."
+    
+    kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-read
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-read
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: monitoring
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Log_Level     info
+        Daemon        off
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+
+    [INPUT]
+        Name              tail
+        Tag               kube.*
+        Path              /var/log/containers/*.log
+        Parser            docker
+        DB                /var/log/flb_kube.db
+        Mem_Buf_Limit     5MB
+        Skip_Long_Lines   On
+        Refresh_Interval  10
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude Off
+
+    [OUTPUT]
+        Name            es
+        Match           kube.*
+        Host            elasticsearch.monitoring.svc.cluster.local
+        Port            9200
+        Logstash_Format On
+        Logstash_Prefix k8s-logs
+        Replace_Dots    On
+        Retry_Limit     False
+        tls             Off
+        Suppress_Type_Name On
+
+  parsers.conf: |
+    [PARSER]
+        Name        docker
+        Format      json
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L
+        Time_Keep   On
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+  labels:
+    app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:latest
+        ports:
+        - containerPort: 2020
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc/
+        resources:
+          limits:
+            memory: 200Mi
+            cpu: 200m
+          requests:
+            memory: 100Mi
+            cpu: 100m
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+EOF
+    print_success "Fluent Bit deployed"
+}
+
 wait_for_pods() {
-    print_status "Waiting for pods..."
+    print_status "Waiting for pods to be ready..."
     
+    echo ""
+    print_status "Waiting for MySQL to initialize (this takes ~30-60 seconds)..."
+    sleep 10
+    
+    print_status "Waiting for DVWA..."
     kubectl wait --for=condition=ready pod -l app=dvwa -n vulnerable-apps --timeout=${TIMEOUT}s 2>/dev/null && \
-        print_success "DVWA ready" || print_warning "DVWA pending"
+        print_success "DVWA ready" || print_warning "DVWA still starting..."
     
+    print_status "Waiting for Juice Shop..."
     kubectl wait --for=condition=ready pod -l app=juice-shop -n vulnerable-apps --timeout=${TIMEOUT}s 2>/dev/null && \
         print_success "Juice Shop ready" || print_warning "Juice Shop pending"
     
+    print_status "Waiting for WebGoat..."
     kubectl wait --for=condition=ready pod -l app=webgoat -n vulnerable-apps --timeout=${TIMEOUT}s 2>/dev/null && \
         print_success "WebGoat ready" || print_warning "WebGoat pending"
     
@@ -396,7 +655,8 @@ print_summary() {
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo "Pod Status:"
-    kubectl get pods -A -l purpose=security-training 2>/dev/null || kubectl get pods -A | grep -E "(vulnerable-apps|attacker|monitoring)"
+    kubectl get pods -n vulnerable-apps
+    kubectl get pods -n attacker
     echo ""
     echo -e "${BLUE}Port Forward Commands:${NC}"
     echo "  kubectl port-forward -n vulnerable-apps svc/dvwa-service 8080:80 &"
@@ -411,7 +671,8 @@ print_summary() {
     echo -e "${BLUE}Connect to Kali:${NC}"
     echo "  kubectl exec -it -n attacker deploy/kali-attacker -- /bin/bash"
     echo ""
-    echo -e "${YELLOW}Note: DVWA requires clicking 'Create / Reset Database' on first access${NC}"
+    echo -e "${YELLOW}IMPORTANT: DVWA requires clicking 'Create / Reset Database' on first access${NC}"
+    echo ""
 }
 
 # Main
@@ -422,5 +683,6 @@ deploy_juice_shop
 deploy_webgoat
 deploy_kali
 deploy_monitoring
+deploy_fluent_bit
 wait_for_pods
 print_summary
